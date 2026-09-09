@@ -14,7 +14,7 @@ class LoginPage {
 
   async enterUsername(stepName, username) {
     await test.step(stepName, async () => {
-      await this.page.locator('#username-wrong').fill(username);
+      await this.page.getByLabel('Username').or(this.page.getByPlaceholder('Username')).first().fill(username);
     });
   }
 
