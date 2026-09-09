@@ -1,0 +1,175 @@
+name: TraceLMs Runner
+
+# Downloaded from TraceLMs Cloud (Settings > Repository Integration).
+# Commit this file to .github/workflows/tracelms-runner.yml in your repo before
+# using "Run Script" in the Script Generation tab. TraceLMs Cloud triggers this
+# workflow via workflow_dispatch and polls its run status — do not rename the
+# file or the `run-script` job without also updating your GitHub PAT's
+# `workflow` scope expectations.
+
+on:
+  workflow_dispatch:
+    inputs:
+      script_path:
+        description: 'Path to the automation script within this repo'
+        required: true
+        type: string
+      framework:
+        description: 'Automation framework'
+        required: true
+        type: choice
+        options:
+          - playwright
+          - selenium
+          - cypress
+          - webdriverio
+          - k6
+      language:
+        description: 'Script language / runtime'
+        required: true
+        type: choice
+        options:
+          - typescript
+          - javascript
+          - python
+          - java
+          - k6
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    # script_path is attacker-influenceable (it originates from a workflow_dispatch
+    # input). Never interpolate ${{ inputs.script_path }} directly into a `run:`
+    # shell string — that pattern is vulnerable to script injection. Assigning it
+    # to an env var here and referencing $SCRIPT_PATH in steps keeps it as inert
+    # data instead of shell-expanded text.
+    env:
+      SCRIPT_PATH: ${{ inputs.script_path }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Node.js runtime (Playwright / Cypress / WebdriverIO) ──────────────────
+      - name: Set up Node.js
+        if: ${{ inputs.language == 'typescript' || inputs.language == 'javascript' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Node dependencies
+        if: ${{ inputs.language == 'typescript' || inputs.language == 'javascript' }}
+        run: npm ci
+
+      # Engineering Intelligence Signal Foundation (P1) — categorizes a broken
+      # script as COMPILE_FAILED/LINT_FAILED rather than a generic execution
+      # failure (GitHubActionsService reads this step's name + conclusion from
+      # the run's job list). Runs against the repo's own tsconfig.json/ESLint
+      # config — a repo with neither will fail this step; that's expected, not
+      # a bug in the runner. Default step gating means a failure here skips
+      # every step below, including framework execution.
+      - name: TypeScript compile check
+        if: ${{ inputs.language == 'typescript' || inputs.language == 'javascript' }}
+        run: npx tsc --noEmit
+
+      - name: ESLint check
+        if: ${{ inputs.language == 'typescript' || inputs.language == 'javascript' }}
+        run: npx eslint "$SCRIPT_PATH"
+
+      - name: Install Playwright browsers
+        if: ${{ inputs.framework == 'playwright' }}
+        run: npx playwright install --with-deps
+
+      - name: Run Playwright script
+        if: ${{ inputs.framework == 'playwright' }}
+        run: npx playwright test "$SCRIPT_PATH"
+
+      # Uploads regardless of pass/fail (not just on failure) so every run has
+      # a reviewable report — screenshots/traces require `screenshot` and
+      # `trace` options set in the repo's own playwright.config.ts; without
+      # one, this step still runs but the report has no visual attachments.
+      - name: Upload Playwright report
+        if: ${{ always() && inputs.framework == 'playwright' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # Feeds TraceLMs Cloud's post-run step breakdown (each test.step() name,
+      # pass/fail, and duration). Requires the repo's own playwright.config.ts
+      # to include a json reporter writing to this exact path — without one,
+      # this step still runs but there's nothing to upload (ignored, not a
+      # failure).
+      - name: Upload test step results
+        if: ${{ always() && inputs.framework == 'playwright' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-step-results
+          path: test-results/results.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Run Cypress script
+        if: ${{ inputs.framework == 'cypress' }}
+        run: npx cypress run --spec "$SCRIPT_PATH"
+
+      - name: Run WebdriverIO script
+        if: ${{ inputs.framework == 'webdriverio' }}
+        run: npx wdio run wdio.conf.js --spec "$SCRIPT_PATH"
+
+      # ── Python runtime (Selenium + pytest) ─────────────────────────────────────
+      - name: Set up Python
+        if: ${{ inputs.language == 'python' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        if: ${{ inputs.language == 'python' }}
+        run: pip install selenium pytest pytest-html
+
+      - name: Run Python automation script
+        if: ${{ inputs.language == 'python' }}
+        run: pytest "$SCRIPT_PATH" --tb=short
+
+      # ── Java runtime (Maven + JUnit 5 + Selenium) ──────────────────────────────
+      # Assumes a pom.xml at the repo root (standard Maven project layout).
+      - name: Set up Java
+        if: ${{ inputs.language == 'java' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+
+      - name: Run Java automation script (Maven)
+        if: ${{ inputs.language == 'java' }}
+        run: mvn -B test
+
+      # ── K6 (Performance, Phase 1) ───────────────────────────────────────────────
+      # language is sent as 'k6' too (not typescript/javascript, even though k6
+      # scripts use JS syntax) specifically so none of the Node.js setup steps
+      # above — gated on inputs.language, not inputs.framework — fire and run
+      # `npm ci` against a repo that may have no package.json at all.
+      - name: Set up k6
+        if: ${{ inputs.framework == 'k6' }}
+        uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: '0.54.0'
+
+      - name: Run k6 script
+        if: ${{ inputs.framework == 'k6' }}
+        run: k6 run "$SCRIPT_PATH" --summary-export=summary.json
+
+      # Feeds TraceLMs Cloud's post-run performance metrics summary (requests,
+      # error rate, p50/p95/p99 latency, throughput, VUs) — k6's own
+      # --summary-export output, not a custom reporter.
+      - name: Upload k6 summary
+        if: ${{ always() && inputs.framework == 'k6' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-summary
+          path: summary.json
+          retention-days: 14
+          if-no-files-found: ignore
